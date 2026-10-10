@@ -9,3 +9,6 @@ venv/
 # Local benchmark output (contains real target addresses)
 results.txt
 results*.json
+
+# Personal Claude Code settings
+.claude/settings.local.json
