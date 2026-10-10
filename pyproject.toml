@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torrelay"
+version = "0.1.0"
+description = "Benchmark Tor circuits to an onion service and pin the fastest guards"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+torrelay = "torrelay.cli:main"
+
+[tool.setuptools]
+packages = ["torrelay"]
