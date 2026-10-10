@@ -1,7 +1,9 @@
-"""Allow ``python -m torrelay``."""
+"""Entry point for ``python -m torrelay``."""
+
+# pylint: disable=invalid-name  # __main__ is mandated by Python.
 
 import sys
 
-from torrelay.cli import main
+from torrelay import cli
 
-sys.exit(main())
+sys.exit(cli.main())

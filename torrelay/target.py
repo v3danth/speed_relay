@@ -1,13 +1,13 @@
-"""Targets as URLs: tcp://, tls://, ssh://, http://, https:// (any host).
+"""Targets expressed as URLs: tcp://, tls://, ssh://, http://, https://.
 
-``host:port`` without a scheme means ``tcp://host:port``.
+A bare ``host:port`` means ``tcp://host:port``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib import parse
 
 DEFAULT_PORTS: dict[str, Optional[int]] = {
     "tcp": None,
@@ -16,11 +16,24 @@ DEFAULT_PORTS: dict[str, Optional[int]] = {
     "http": 80,
     "https": 443,
 }
+_HTTP_SCHEMES = ("http", "https")
+_TLS_SCHEMES = ("tls", "https")
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Target:
-    """Where to connect and which protocol probe to run."""
+    """Where to connect and which protocol probe to run.
+
+    Attributes:
+        scheme: One of ``DEFAULT_PORTS``; selects the probe.
+        host: Hostname (.onion or clearnet).
+        port: TCP port.
+        path: HTTP path including any query string.
+        user: SSH login name.
+        key: Path to an SSH private key.
+        ssh_options: Extra ``ssh -o`` options as ``KEY=VALUE``.
+        insecure: Skip TLS certificate verification.
+    """
 
     scheme: str
     host: str
@@ -29,29 +42,54 @@ class Target:
     user: Optional[str] = None
     key: Optional[str] = None
     ssh_options: tuple[str, ...] = ()
-    insecure: bool = False  # skip TLS certificate verification
+    insecure: bool = False
 
     @property
     def is_onion(self) -> bool:
+        """Whether the host is a Tor onion service (no exit, no DNS)."""
         return self.host.lower().rstrip(".").endswith(".onion")
 
     @property
     def uses_tls(self) -> bool:
-        return self.scheme in ("tls", "https")
+        """Whether the protocol runs over TLS."""
+        return self.scheme in _TLS_SCHEMES
+
+    @property
+    def is_http(self) -> bool:
+        """Whether the protocol is HTTP or HTTPS."""
+        return self.scheme in _HTTP_SCHEMES
+
+    @property
+    def destination(self) -> str:
+        """``user@host`` (or ``host``) as ssh expects it."""
+        return f"{self.user}@{self.host}" if self.user else self.host
 
     @property
     def url(self) -> str:
+        """Canonical URL, used for display and for saved results."""
         user = f"{self.user}@" if self.user else ""
-        default = DEFAULT_PORTS[self.scheme]
-        port = "" if self.port == default else f":{self.port}"
-        path = self.path if self.scheme in ("http", "https") else ""
+        port = ("" if self.port == DEFAULT_PORTS[self.scheme]
+                else f":{self.port}")
+        path = self.path if self.is_http else ""
         return f"{self.scheme}://{user}{self.host}{port}{path}"
 
 
 def parse_target(text: str) -> Target:
-    """Parse a target URL; raises ValueError with a helpful message."""
-    raw = text if "://" in text else f"tcp://{text}"
-    parts = urlsplit(raw)
+    """Parses a target URL given on the command line.
+
+    URLs keep the CLI uniform across protocols: one argument says what to
+    reach and how.
+
+    Args:
+        text: A URL, or ``host:port`` for plain TCP.
+
+    Returns:
+        The parsed target.
+
+    Raises:
+        ValueError: If the scheme is unsupported or the host/port missing.
+    """
+    parts = parse.urlsplit(text if "://" in text else f"tcp://{text}")
     scheme = parts.scheme.lower()
     if scheme not in DEFAULT_PORTS:
         raise ValueError(f"unsupported scheme {scheme!r}; use one of "
@@ -61,5 +99,6 @@ def parse_target(text: str) -> Target:
     port = parts.port or DEFAULT_PORTS[scheme]
     if port is None:
         raise ValueError(f"{text!r} needs a port, e.g. tcp://host:25")
-    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-    return Target(scheme, parts.hostname, port, path, parts.username)
+    query = f"?{parts.query}" if parts.query else ""
+    return Target(scheme, parts.hostname, port, (parts.path or "/") + query,
+                  parts.username)

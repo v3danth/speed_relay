@@ -2,54 +2,144 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+import dataclasses
 from typing import Iterable, Optional
 
-from torrelay.bench import Result
-from torrelay.target import Target
+from torrelay import bench
+from torrelay import target as target_lib
+from torrelay import tor
+
+GUARD_KEY = "guard_fingerprint"
+EXIT_KEY = "exit_fingerprint"
+
+_COLUMNS = (  # (header, width, Result attribute, decimals)
+    ("conn s", 7, "connect_s", 1),
+    ("hs s", 6, "handshake_s", 1),
+    ("lat ms", 8, "latency_ms", 0),
+    ("down KiB", 9, "down_kib", 0),
+    ("up KiB", 8, "up_kib", 0),
+)
+_NAME_TITLE = "route"
+_NAME_WIDTH = 11
 
 
-def _num(value: Optional[float], width: int, digits: int = 0) -> str:
+def _number(value: Optional[float], width: int, decimals: int) -> str:
+    """Right-aligns a number, or ``-`` when it was not measured.
+
+    Args:
+        value: The measurement.
+        width: Column width.
+        decimals: Digits after the decimal point.
+
+    Returns:
+        The formatted cell.
+    """
     if value is None:
         return "-".rjust(width)
-    return f"{value:>{width}.{digits}f}"
+    return f"{value:>{width}.{decimals}f}"
 
 
-def format_row(result: Result) -> str:
-    cells = "".join((
-        f"{result.name:<11}",
-        _num(result.connect_s, 7, 1),
-        _num(result.handshake_s, 6, 1),
-        _num(result.latency_ms, 8),
-        _num(result.down_kib, 9),
-        _num(result.up_kib, 8),
-    ))
+def _status(result: bench.Result) -> str:
+    """Renders the trailing status column: path and detail, or the error.
+
+    Args:
+        result: One route's result.
+
+    Returns:
+        ``OK <path> [detail]`` or ``FAIL <error>``.
+    """
     if result.error:
-        return f"{cells}  FAIL {result.error}"
-    path = " -> ".join(h.label for h in result.hops) or "(no circuit info)"
+        return f"FAIL {result.error}"
+    path = tor.format_path(result.hops) or "(no circuit info)"
     detail = f"  [{result.detail}]" if result.detail else ""
-    return f"{cells}  OK   {path}{detail}"
+    return f"OK   {path}{detail}"
 
 
-def format_table(results: Iterable[Result]) -> str:
-    header = (f"{'route':<11}{'conn s':>7}{'hs s':>6}{'lat ms':>8}"
-              f"{'down KiB':>9}{'up KiB':>8}  status / path")
-    return "\n".join((header, *map(format_row, results)))
+def format_row(result: bench.Result) -> str:
+    """Renders one result as a table row.
+
+    Args:
+        result: One route's result.
+
+    Returns:
+        The row text.
+    """
+    cells = "".join(_number(getattr(result, attr), width, decimals)
+                    for _, width, attr, decimals in _COLUMNS)
+    return f"{result.name:<{_NAME_WIDTH}}{cells}  {_status(result)}"
 
 
-def to_dict(result: Result, target: Target) -> dict:
-    """JSON-ready row; exits only exist for clearnet circuits."""
-    hops = result.hops
-    exit_fp = (hops[-1].fingerprint
-               if len(hops) >= 3 and not target.is_onion else None)
-    return {**asdict(result), "ok": result.ok,
-            "latency_ms": result.latency_ms,
-            "guard_fingerprint": hops[0].fingerprint if hops else None,
-            "exit_fingerprint": exit_fp}
+def format_header() -> str:
+    """Renders the table header matching ``format_row``.
+
+    Returns:
+        The header text.
+    """
+    cells = "".join(f"{title:>{width}}" for title, width, _, _ in _COLUMNS)
+    return f"{_NAME_TITLE:<{_NAME_WIDTH}}{cells}  status / path"
 
 
-def top_relays(rows: Iterable[dict], n: int,
-               key: str = "guard_fingerprint") -> tuple[str, ...]:
-    """First ``n`` distinct fingerprints under ``key`` of successful rows."""
-    fps = (r[key] for r in rows if r.get("ok") and r.get(key))
-    return tuple(dict.fromkeys(fps))[:n]
+def format_table(results: Iterable[bench.Result]) -> str:
+    """Renders results as an aligned text table for the terminal.
+
+    Args:
+        results: Results, already ranked.
+
+    Returns:
+        The table text.
+    """
+    return "\n".join((format_header(), *map(format_row, results)))
+
+
+def exit_fingerprint(result: bench.Result,
+                     target: target_lib.Target) -> Optional[str]:
+    """Identifies the exit relay of a clearnet circuit.
+
+    Onion circuits end at a rendezvous point, which is not an exit and
+    cannot be pinned, so they have none.
+
+    Args:
+        result: One route's result.
+        target: The benchmarked destination.
+
+    Returns:
+        The exit's fingerprint, or None.
+    """
+    if target.is_onion or len(result.hops) < 3:
+        return None
+    return result.hops[-1].fingerprint
+
+
+def to_dict(result: bench.Result, target: target_lib.Target) -> dict:
+    """Serialises a result for ``--json`` and saved results.
+
+    Args:
+        result: One route's result.
+        target: The benchmarked destination.
+
+    Returns:
+        A JSON-ready dict including derived fields used for pinning.
+    """
+    return {
+        **dataclasses.asdict(result),
+        "ok": result.ok,
+        "latency_ms": result.latency_ms,
+        GUARD_KEY: result.hops[0].fingerprint if result.hops else None,
+        EXIT_KEY: exit_fingerprint(result, target),
+    }
+
+
+def top_relays(rows: Iterable[dict], count: int,
+               key: str = GUARD_KEY) -> tuple[str, ...]:
+    """Picks the best distinct relays from ranked rows, for pinning.
+
+    Args:
+        rows: Serialised results, best first.
+        count: How many relays to return.
+        key: ``GUARD_KEY`` or ``EXIT_KEY``.
+
+    Returns:
+        Up to ``count`` fingerprints from successful rows.
+    """
+    fingerprints = (row[key] for row in rows if row.get("ok") and row.get(key))
+    return tuple(dict.fromkeys(fingerprints))[:count]

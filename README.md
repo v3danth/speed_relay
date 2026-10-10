@@ -101,8 +101,24 @@ pinnable (guards; onions have no exit). Tor performance drifts, so a
 single run is a snapshot, and you should re-bench when things feel slow.
 Pinning relays reduces anonymity, so keep a profile's Tor for its target.
 
-## Tests
+## Development
+
+The code follows the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)
+and PEP 8:
+
+- imports name modules only (`from torrelay import tor`, then `tor.Hop`),
+  with an exception for `typing`;
+- every function and class, including private and nested ones, has a
+  Google-style docstring saying why it exists;
+- functions do one thing; shared logic lives in one place (`util`,
+  `probes.open_stream`, `profile.Profile.socks_chain`, ...).
 
 ```bash
-python3 -m unittest discover -s tests -t .
+pip install -e '.[dev]'                       # pylint + ruff
+python3 -m unittest discover -s tests -t .    # unit + style tests
+ruff check . bin/torrelay                     # PEP 8, Google docstrings/imports
+pylint torrelay tests bin/torrelay            # Google's pylintrc (.pylintrc)
 ```
+
+`tests/test_style.py` enforces the docstring and import rules, which
+linters do not fully cover.

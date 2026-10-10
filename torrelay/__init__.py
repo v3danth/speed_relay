@@ -1,3 +1,3 @@
-"""torrelay: benchmark Tor circuits to an onion service and pin the best."""
+"""torrelay: race Tor circuits to any target and pin the fastest relays."""
 
 __version__ = "0.1.0"

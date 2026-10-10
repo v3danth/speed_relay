@@ -5,12 +5,34 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torrelay"
 version = "0.1.0"
-description = "Benchmark Tor circuits to an onion service and pin the fastest guards"
+description = "Race Tor circuits to any target and pin the fastest relays"
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["pylint>=3", "ruff>=0.5"]
 
 [project.scripts]
 torrelay = "torrelay.cli:main"
 
 [tool.setuptools]
 packages = ["torrelay"]
+
+# Google Python Style Guide + PEP 8. pylint reads .pylintrc (Google's).
+[tool.ruff]
+line-length = 79
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "D", "N", "I", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+# Google: one import per line (typing excepted), sorted by full module path.
+force-single-line = true
+single-line-exclusions = ["typing"]
+force-sort-within-sections = true
+known-first-party = ["torrelay"]

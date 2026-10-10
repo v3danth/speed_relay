@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Run torrelay from a checkout without installing or touching PATH."""
+"""Runs torrelay from a checkout without installing it or touching PATH."""
 
 import os
+import runpy
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.realpath(__file__))))
-
-from torrelay.cli import main  # noqa: E402
-
-sys.exit(main())
+runpy.run_module("torrelay", run_name="__main__", alter_sys=True)
