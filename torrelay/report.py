@@ -23,7 +23,7 @@ _NAME_TITLE = "route"
 _NAME_WIDTH = 11
 
 
-def _number(value: Optional[float], width: int, decimals: int) -> str:
+def number(value: Optional[float], width: int, decimals: int) -> str:
     """Right-aligns a number, or ``-`` when it was not measured.
 
     Args:
@@ -64,7 +64,7 @@ def format_row(result: bench.Result) -> str:
     Returns:
         The row text.
     """
-    cells = "".join(_number(getattr(result, attr), width, decimals)
+    cells = "".join(number(getattr(result, attr), width, decimals)
                     for _, width, attr, decimals in _COLUMNS)
     return f"{result.name:<{_NAME_WIDTH}}{cells}  {_status(result)}"
 

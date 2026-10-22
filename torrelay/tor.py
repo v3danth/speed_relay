@@ -13,10 +13,12 @@ import socket
 import subprocess
 import threading
 import time
-from typing import IO, Optional, Sequence
+from typing import IO, Callable, Optional, Sequence
 
 TOR_BIN = shutil.which("tor") or "/opt/homebrew/bin/tor"
 BOOTSTRAP_DONE = "Bootstrapped 100%"
+
+_BOOTSTRAP_RE = re.compile(r"Bootstrapped (\d+)%(?: \([^)]*\))?: (.*)")
 
 _FINGERPRINT_RE = re.compile(r"^\$?([0-9A-Fa-f]{40})$")
 _CONTROL_TIMEOUT = 10.0
@@ -75,6 +77,7 @@ class TorNode:
 
 GuardState = tuple[Hop, str]
 CircuitTable = dict[str, tuple[str, tuple[Hop, ...]]]
+Progress = Callable[[int, str], None]  # (percent, summary)
 
 
 # --------------------------------------------------------------------------
@@ -220,7 +223,8 @@ def ephemeral_torrc(data_dir: str, extra: Sequence[str] = ()) -> str:
     """Renders the torrc for a throwaway benchmark instance.
 
     Ports are ``auto`` so any number of instances can run side by side
-    without colliding with each other or with existing services.
+    without colliding with each other or with existing services. Tor
+    exits by itself if torrelay dies, so an interrupt never leaks one.
 
     Args:
         data_dir: The instance's private DataDirectory.
@@ -238,6 +242,7 @@ def ephemeral_torrc(data_dir: str, extra: Sequence[str] = ()) -> str:
         f"DataDirectory {data_dir}",
         "Log notice stdout",
         "AvoidDiskWrites 1",
+        f"__OwningControllerProcess {os.getpid()}",
         *extra,
         "",
     ))
@@ -465,7 +470,21 @@ def spawn(torrc: str) -> subprocess.Popen:
     )
 
 
-def wait_for_bootstrap(proc: subprocess.Popen, timeout: float) -> None:
+def parse_bootstrap(line: str) -> Optional[tuple[int, str]]:
+    """Extracts progress from a Tor ``Bootstrapped NN%`` log line.
+
+    Args:
+        line: One line of Tor's log.
+
+    Returns:
+        ``(percent, summary)``, or None for other lines.
+    """
+    match = _BOOTSTRAP_RE.search(line)
+    return (int(match.group(1)), match.group(2).strip()) if match else None
+
+
+def wait_for_bootstrap(proc: subprocess.Popen, timeout: float,
+                       on_progress: Optional[Progress] = None) -> None:
     """Blocks until Tor logs that it has fully bootstrapped.
 
     A watchdog kills Tor at the deadline, which ends the log stream and
@@ -474,6 +493,7 @@ def wait_for_bootstrap(proc: subprocess.Popen, timeout: float) -> None:
     Args:
         proc: Process started by ``spawn``.
         timeout: Seconds to allow.
+        on_progress: Called with each bootstrap percentage Tor reports.
 
     Raises:
         RuntimeError: If Tor exits or times out first, with its last log.
@@ -484,6 +504,9 @@ def wait_for_bootstrap(proc: subprocess.Popen, timeout: float) -> None:
     try:
         for line in proc.stdout:
             last = line.strip()
+            progress = parse_bootstrap(line)
+            if progress and on_progress:
+                on_progress(*progress)
             if BOOTSTRAP_DONE in line:
                 return
     finally:
@@ -517,7 +540,8 @@ def read_control_port(data_dir: str) -> int:
 
 
 def launch_ephemeral(name: str, data_dir: str, timeout: float,
-                     extra: Sequence[str] = ()) -> TorNode:
+                     extra: Sequence[str] = (),
+                     on_progress: Optional[Progress] = None) -> TorNode:
     """Starts a private Tor instance and waits until it is usable.
 
     Each benchmark instance gets its own guard and circuits, which is what
@@ -528,6 +552,7 @@ def launch_ephemeral(name: str, data_dir: str, timeout: float,
         data_dir: Fresh directory for this instance.
         timeout: Seconds allowed for bootstrapping.
         extra: Additional torrc lines (e.g. pinned relays).
+        on_progress: Called with each bootstrap percentage Tor reports.
 
     Returns:
         The running instance.
@@ -539,7 +564,7 @@ def launch_ephemeral(name: str, data_dir: str, timeout: float,
     start = time.monotonic()
     proc = spawn(torrc)
     try:
-        wait_for_bootstrap(proc, timeout)
+        wait_for_bootstrap(proc, timeout, on_progress)
         drain_output(proc)
         endpoint = ControlEndpoint(read_control_port(data_dir), data_dir)
         return TorNode(name, socks_listener_port(endpoint), endpoint, proc,

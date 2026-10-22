@@ -4,6 +4,7 @@ import io
 import unittest
 
 from torrelay import bench
+from torrelay import live
 from torrelay import probes
 from torrelay import profile as profile_lib
 from torrelay import report
@@ -310,6 +311,34 @@ class RankingTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith("route"))
         self.assertIn("OK", lines[1])
         self.assertIn("FAIL boom", lines[2])
+
+
+class LiveTest(unittest.TestCase):
+    """Live view ordering and Tor bootstrap parsing."""
+
+    def test_parse_bootstrap(self):
+        """Tor's progress lines yield percent and summary; others None."""
+        line = ("Oct 12 12:49:36.000 [notice] Bootstrapped 73% "
+                "(loading_descriptors): Loading relay descriptors")
+        self.assertEqual(tor.parse_bootstrap(line),
+                         (73, "Loading relay descriptors"))
+        self.assertIsNone(tor.parse_bootstrap("[notice] Opening Socks"))
+
+    def test_ranked_orders_done_running_failed(self):
+        """Done rows rank by score; running keep order; failed sink."""
+        def row(stage, **fields):
+            """Builds a row in ``stage`` with a result of ``fields``."""
+            return live._Row(stage, result=bench.Result("x", **fields))  # pylint: disable=protected-access
+
+        rows = [
+            ("broken", row("failed", error="boom")),
+            ("slow", row("done", connect_s=1, ttfb_ms=900, down_kib=50)),
+            ("busy", row("download", connect_s=1)),
+            ("fast", row("done", connect_s=1, ttfb_ms=300, down_kib=900)),
+            ("queued", row("queued")),
+        ]
+        self.assertEqual([name for name, _ in live.ranked(rows)],
+                         ["fast", "slow", "busy", "queued", "broken"])
 
 
 if __name__ == "__main__":

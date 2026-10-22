@@ -1,23 +1,27 @@
 """Race a target across many routes (Tor circuits, SOCKS ports, direct).
 
-A run is two phases over a list of routes:
+Every route runs its own pipeline, all routes at once:
 
-1. latency: every route at once (connectivity, handshake, rtt);
-2. throughput: one route at a time by default, so routes don't compete.
+1. start: bootstrap a fresh Tor (one at a time unless asked to overlap);
+2. latency: connectivity, handshake, rtt, as soon as the route is up;
+3. throughput: one route at a time by default, so routes don't compete.
 
-Each phase folds named steps over an immutable Result; the first failing
-step records its error and the remaining steps are skipped.
+Each stage folds named steps over an immutable Result; the first failing
+step records its error and the remaining steps are skipped. An Observer
+sees every stage change, which is what drives the live dashboard.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import os
 import shutil
 import statistics
 import tempfile
-from typing import Callable, Iterable, Optional, Sequence
+import threading
+from typing import Callable, ContextManager, Iterable, Optional, Sequence
 
 from torrelay import probes
 from torrelay import target as target_lib
@@ -39,6 +43,7 @@ class BenchOptions:
         size_mib: Maximum MiB per throughput test.
         rtt_samples: SSH echo round trips to time.
         parallel_throughput: Overlap throughput tests across routes.
+        parallel_bootstrap: Start all Tor instances at once.
         bootstrap_timeout: Seconds allowed for each Tor to start.
         guards: One pinned guard fingerprint per instance.
         exits: One pinned exit fingerprint per instance.
@@ -50,6 +55,7 @@ class BenchOptions:
     size_mib: int = 4
     rtt_samples: int = 10
     parallel_throughput: bool = False
+    parallel_bootstrap: bool = False
     bootstrap_timeout: float = 180
     guards: tuple[str, ...] = ()
     exits: tuple[str, ...] = ()
@@ -125,8 +131,55 @@ class InstanceSpec:
     label: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class Lane:
+    """One route still to be brought up and measured.
+
+    Attributes:
+        name: Display name, e.g. ``tor0``.
+        start: Brings the route up (e.g. bootstraps Tor); may raise.
+        pinned: Description of relays pinned for this route.
+    """
+
+    name: str
+    start: Callable[[], Route]
+    pinned: str = ""
+
+
+class Observer:
+    """Receives live progress from a run; this base class ignores it.
+
+    Plain runs report through the log; the live dashboard subclasses this.
+    Methods are called from many threads at once.
+    """
+
+    def begin(self, names: Sequence[str]) -> None:
+        """Announces the routes about to run, in display order.
+
+        Args:
+            names: Route names.
+        """
+
+    def stage(self, name: str, stage: str,
+              percent: Optional[int] = None) -> None:
+        """Reports that a route moved to a new stage.
+
+        Args:
+            name: Route name.
+            stage: What it is doing, e.g. ``connect`` or ``done``.
+            percent: Progress through the stage, when known.
+        """
+
+    def update(self, result: Result) -> None:
+        """Reports a route's latest measurements.
+
+        Args:
+            result: The route's result so far.
+        """
+
+
+QUIET = Observer()
 Step = tuple[str, Callable[[], dict]]
-Launch = tuple[InstanceSpec, Optional[tor.TorNode], Optional[str]]
 
 _FIELD_FORMATS = {
     "connect_s": "connect {:.2f}s",
@@ -161,7 +214,8 @@ def describe(fields: dict) -> str:
 # Step combinators
 # --------------------------------------------------------------------------
 
-def attempt(result: Result, step: Step) -> Result:
+def attempt(result: Result, step: Step,
+            observer: Observer = QUIET) -> Result:
     """Runs one step unless an earlier step failed.
 
     Errors are captured per route so one bad circuit never aborts the
@@ -170,6 +224,7 @@ def attempt(result: Result, step: Step) -> Result:
     Args:
         result: Measurements so far.
         step: ``(label, fn)`` where ``fn`` returns new fields.
+        observer: Told when the step starts and what it measured.
 
     Returns:
         ``result`` updated with the step's fields or its error.
@@ -177,28 +232,35 @@ def attempt(result: Result, step: Step) -> Result:
     if result.error:
         return result
     label, fn = step
+    observer.stage(result.name, label)
     try:
         fields = fn()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # Any failure (socket, ssl, ssh, http) is a result, not a crash.
         message = str(exc) or type(exc).__name__
         util.log(f"[{result.name}] {label} failed: {message}")
-        return dataclasses.replace(result, error=f"{label}: {message}")
-    util.log(f"[{result.name}] {label}: {describe(fields)}")
-    return dataclasses.replace(result, **fields)
+        updated = dataclasses.replace(result, error=f"{label}: {message}")
+    else:
+        util.log(f"[{result.name}] {label}: {describe(fields)}")
+        updated = dataclasses.replace(result, **fields)
+    observer.update(updated)
+    return updated
 
 
-def run_steps(result: Result, steps: Iterable[Step]) -> Result:
+def run_steps(result: Result, steps: Iterable[Step],
+              observer: Observer = QUIET) -> Result:
     """Folds steps over a result, short-circuiting after a failure.
 
     Args:
         result: Starting measurements.
         steps: Steps in order.
+        observer: Receives progress from each step.
 
     Returns:
         The final result.
     """
-    return functools.reduce(attempt, steps, result)
+    return functools.reduce(
+        lambda done, step: attempt(done, step, observer), steps, result)
 
 
 def latency_plan(target: Target, opts: BenchOptions,
@@ -287,86 +349,76 @@ def rank(results: Iterable[Result]) -> list[Result]:
 # Phases
 # --------------------------------------------------------------------------
 
-def _fresh_result(route: Route) -> Result:
-    """Creates the empty result a route's measurements start from.
+def _gate(parallel: bool) -> ContextManager:
+    """Returns a context that serialises a stage unless it may overlap.
 
     Args:
-        route: The route being measured.
+        parallel: Whether lanes may run the stage at the same time.
 
     Returns:
-        A result carrying only the route's identity.
+        A no-op context, or a lock shared by all lanes.
     """
-    return Result(route.name, bootstrap_s=route.bootstrap_s,
-                  pinned=route.pinned)
+    return contextlib.nullcontext() if parallel else threading.Lock()
 
 
-def latency_phase(target: Target, opts: BenchOptions,
-                  routes: Sequence[Route]) -> list[Result]:
-    """Tests connectivity and latency on every route simultaneously.
+def _ready(route: Route) -> Lane:
+    """Wraps a route that is already up (SOCKS port, direct) as a lane.
+
+    Args:
+        route: The route.
+
+    Returns:
+        A lane whose start returns ``route`` immediately.
+    """
+    return Lane(route.name, lambda: route, route.pinned)
+
+
+def race(target: Target, opts: BenchOptions, lanes: Sequence[Lane],
+         observer: Observer = QUIET) -> list[Result]:
+    """Runs every lane through start, latency and throughput, then ranks.
+
+    Lanes are pipelined: each is measured as soon as it is up, so fast
+    starters never wait for slow ones. Throughput tests still take turns
+    unless asked to overlap, so routes don't compete for the uplink.
 
     Args:
         target: Destination.
         opts: Benchmark options.
-        routes: Routes to test.
-
-    Returns:
-        One result per route, in route order.
-    """
-    plural = "route" if len(routes) == 1 else "routes simultaneously"
-    util.log(f"\n== Connectivity & latency: {target.url} "
-             f"({len(routes)} {plural}) ==")
-    return util.pmap(lambda route: run_steps(
-        _fresh_result(route), latency_plan(target, opts, route)), routes)
-
-
-def throughput_phase(target: Target, opts: BenchOptions,
-                     routes: Sequence[Route],
-                     results: Sequence[Result]) -> list[Result]:
-    """Measures bandwidth, sequentially unless asked to overlap.
-
-    Sequential runs stop routes from competing for the same uplink, which
-    would otherwise make every route look slow.
-
-    Args:
-        target: Destination.
-        opts: Benchmark options.
-        routes: Routes, aligned with ``results``.
-        results: Latency-phase results.
-
-    Returns:
-        Updated results, in route order.
-    """
-    if any(throughput_plan(target, opts, route) for route in routes):
-        mode = "parallel" if opts.parallel_throughput else "sequential"
-        util.log(f"\n== Throughput ({mode}, up to {opts.size_mib} MiB) ==")
-
-    def measure_one(pair: tuple[Route, Result]) -> Result:
-        """Runs the throughput steps for one route."""
-        route, result = pair
-        return run_steps(result, throughput_plan(target, opts, route))
-
-    pairs = list(zip(routes, results))
-    if opts.parallel_throughput:
-        return util.pmap(measure_one, pairs)
-    return list(map(measure_one, pairs))
-
-
-def measure(target: Target, opts: BenchOptions, routes: Sequence[Route],
-            failed: Sequence[Result] = ()) -> list[Result]:
-    """Runs both phases over ``routes`` and ranks the outcome.
-
-    Args:
-        target: Destination.
-        opts: Benchmark options.
-        routes: Routes to test.
-        failed: Results for routes that never started (ranked last).
+        lanes: Routes to bring up and measure.
+        observer: Receives live progress.
 
     Returns:
         All results, best first.
     """
-    latency = latency_phase(target, opts, routes)
-    final = throughput_phase(target, opts, routes, latency)
-    return rank([*final, *failed])
+    mode = "parallel" if opts.parallel_throughput else "one at a time"
+    util.log(f"== {target.url}: {len(lanes)} routes; each is tested as "
+             f"soon as it is up (speed tests {mode}) ==")
+    observer.begin([lane.name for lane in lanes])
+    throughput_gate = _gate(opts.parallel_throughput)
+
+    def one(lane: Lane) -> Result:
+        """Takes one lane from start to its final result."""
+        result = Result(lane.name, pinned=lane.pinned)
+        try:
+            route = lane.start()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A route that won't come up is reported, not raised.
+            util.log(f"[{lane.name}] {exc}")
+            result = dataclasses.replace(result, error=f"bootstrap: {exc}")
+        else:
+            result = run_steps(
+                dataclasses.replace(result, bootstrap_s=route.bootstrap_s),
+                latency_plan(target, opts, route), observer)
+            steps = throughput_plan(target, opts, route)
+            if steps and result.ok:
+                observer.stage(lane.name, "waiting to speed test")
+                with throughput_gate:
+                    result = run_steps(result, steps, observer)
+        observer.update(result)
+        observer.stage(lane.name, "done" if result.ok else "failed")
+        return result
+
+    return rank(util.pmap(one, lanes))
 
 
 def baseline_routes(opts: BenchOptions) -> list[Route]:
@@ -450,44 +502,45 @@ def instance_specs(opts: BenchOptions) -> tuple[InstanceSpec, ...]:
     return tuple(map(spec, range(count)))
 
 
-def _launch(base_dir: str, timeout: float, spec: InstanceSpec) -> Launch:
-    """Starts one instance, capturing failure instead of raising.
+def _tor_lane(spec: InstanceSpec, base_dir: str, opts: BenchOptions,
+              gate: ContextManager, nodes: list[tor.TorNode],
+              observer: Observer) -> Lane:
+    """Builds the lane that bootstraps one fresh Tor instance.
 
     Args:
-        base_dir: Parent directory for the instance's data.
-        timeout: Bootstrap timeout in seconds.
         spec: What to start.
+        base_dir: Parent directory for the instance's data.
+        opts: Benchmark options (bootstrap timeout).
+        gate: Held while bootstrapping, to take turns unless parallel.
+        nodes: Started instances are added here so they can be stopped.
+        observer: Receives bootstrap progress.
 
     Returns:
-        ``(spec, node, None)`` on success, ``(spec, None, error)`` otherwise.
+        The lane.
     """
-    try:
-        node = tor.launch_ephemeral(spec.name,
-                                    os.path.join(base_dir, spec.name),
-                                    timeout, spec.torrc_lines)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        # A Tor that won't start is reported as a failed route.
-        util.log(f"[{spec.name}] {exc}")
-        return spec, None, str(exc)
-    suffix = f" ({spec.label})" if spec.label else ""
-    util.log(f"[{spec.name}] bootstrapped in {node.bootstrap_s:.1f}s{suffix}")
-    return spec, node, None
+    def progress(percent: int, summary: str) -> None:
+        """Forwards one Tor bootstrap log line to the observer."""
+        observer.stage(spec.name, f"bootstrap: {summary}", percent)
+
+    def start() -> Route:
+        """Bootstraps the instance and returns a route through it."""
+        observer.stage(spec.name, "queued")
+        with gate:
+            observer.stage(spec.name, "bootstrap", 0)
+            node = tor.launch_ephemeral(
+                spec.name, os.path.join(base_dir, spec.name),
+                opts.bootstrap_timeout, spec.torrc_lines, progress)
+        nodes.append(node)
+        suffix = f" ({spec.label})" if spec.label else ""
+        util.log(f"[{spec.name}] bootstrapped in {node.bootstrap_s:.1f}s"
+                 f"{suffix}")
+        return probes.tor_route(node, spec.label)
+
+    return Lane(spec.name, start, spec.label)
 
 
-def _failed_result(launch: Launch) -> Result:
-    """Turns a failed launch into a ranked-last result.
-
-    Args:
-        launch: A launch outcome with an error.
-
-    Returns:
-        A failed result for the table.
-    """
-    spec, _, error = launch
-    return Result(spec.name, pinned=spec.label, error=f"bootstrap: {error}")
-
-
-def run(target: Target, opts: BenchOptions) -> list[Result]:
+def run(target: Target, opts: BenchOptions,
+        observer: Observer = QUIET) -> list[Result]:
     """Races fresh Tor instances (plus optional baseline) to a target.
 
     Instances are always stopped and their data removed, even on Ctrl-C.
@@ -495,40 +548,39 @@ def run(target: Target, opts: BenchOptions) -> list[Result]:
     Args:
         target: Destination.
         opts: Benchmark options.
+        observer: Receives live progress.
 
     Returns:
         Results, best first.
     """
     base_dir = tempfile.mkdtemp(prefix="torrelay_")
-    specs = instance_specs(opts)
-    launches: list[Launch] = []
+    nodes: list[tor.TorNode] = []
+    # Taking turns keeps instances from competing for bandwidth while
+    # fetching the consensus; the first one up is tested meanwhile.
+    gate = _gate(opts.parallel_bootstrap)
+    lanes = [_tor_lane(spec, base_dir, opts, gate, nodes, observer)
+             for spec in instance_specs(opts)]
     try:
-        util.log(f"Launching {len(specs)} Tor instances in parallel ...")
-        launches = util.pmap(functools.partial(
-            _launch, base_dir, opts.bootstrap_timeout), specs)
-        routes = [probes.tor_route(node, spec.label)
-                  for spec, node, _ in launches if node]
-        failed = [_failed_result(item) for item in launches if not item[1]]
-        return measure(target, opts, [*routes, *baseline_routes(opts)],
-                       failed)
+        return race(target, opts,
+                    [*lanes, *map(_ready, baseline_routes(opts))], observer)
     finally:
-        for _, node, _ in launches:
-            if node:
-                tor.stop(node.proc)
+        for node in nodes:
+            tor.stop(node.proc)
         shutil.rmtree(base_dir, ignore_errors=True)
 
 
-def check(target: Target, opts: BenchOptions,
-          socks_ports: Sequence[int]) -> list[Result]:
+def check(target: Target, opts: BenchOptions, socks_ports: Sequence[int],
+          observer: Observer = QUIET) -> list[Result]:
     """Measures through already-running SOCKS proxies (no bootstrap).
 
     Args:
         target: Destination.
         opts: Benchmark options.
         socks_ports: Proxies to test, e.g. ``(9050,)``.
+        observer: Receives live progress.
 
     Returns:
         Results, best first.
     """
     routes = [*map(probes.socks_route, socks_ports), *baseline_routes(opts)]
-    return measure(target, opts, routes)
+    return race(target, opts, list(map(_ready, routes)), observer)

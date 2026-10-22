@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
-from concurrent import futures
+import contextlib
 import socket
 import sys
 import threading
 import time
-from typing import Callable, Sequence, TypeVar
+from typing import Callable, Iterator, Sequence, TypeVar
 
 T = TypeVar("T")
 R = TypeVar("R")
+Sink = Callable[[str], None]
 
 _LOG_LOCK = threading.Lock()
+
+
+def _to_stderr(message: str) -> None:
+    """Prints a log message to stderr, the default sink.
+
+    Args:
+        message: Text to print.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
+_sink: Sink = _to_stderr
 
 
 def log(message: str) -> None:
@@ -25,14 +38,36 @@ def log(message: str) -> None:
         message: Text to print.
     """
     with _LOG_LOCK:
-        print(message, file=sys.stderr, flush=True)
+        _sink(message)
+
+
+@contextlib.contextmanager
+def log_to(sink: Sink) -> Iterator[None]:
+    """Sends ``log`` output somewhere else, e.g. a full-screen view.
+
+    Args:
+        sink: Receives each message.
+
+    Yields:
+        Nothing; the previous sink is restored on exit.
+    """
+    global _sink  # pylint: disable=global-statement
+    with _LOG_LOCK:
+        previous, _sink = _sink, sink
+    try:
+        yield
+    finally:
+        with _LOG_LOCK:
+            _sink = previous
 
 
 def pmap(fn: Callable[[T], R], items: Sequence[T]) -> list[R]:
     """Maps ``fn`` over ``items`` concurrently, preserving order.
 
     Network probes spend almost all their time waiting, so one thread per
-    item gives true parallelism without the complexity of asyncio.
+    item gives true parallelism without the complexity of asyncio. The
+    threads are daemons, so Ctrl-C is never held up by a probe that is
+    still waiting on the network.
 
     Args:
         fn: Function applied to each item.
@@ -40,11 +75,30 @@ def pmap(fn: Callable[[T], R], items: Sequence[T]) -> list[R]:
 
     Returns:
         The results, in the same order as ``items``.
+
+    Raises:
+        BaseException: The first item's exception, in item order.
     """
-    if not items:
-        return []
-    with futures.ThreadPoolExecutor(len(items)) as pool:
-        return list(pool.map(fn, items))
+    outcomes: list[tuple[bool, object]] = [(False, None)] * len(items)
+
+    def work(index: int) -> None:
+        """Runs ``fn`` on one item, recording its value or exception."""
+        try:
+            outcomes[index] = (True, fn(items[index]))
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+            # Re-raised in the caller's thread below.
+            outcomes[index] = (False, exc)
+
+    threads = [threading.Thread(target=work, args=(index,), daemon=True)
+               for index in range(len(items))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for ok, value in outcomes:
+        if not ok:
+            raise value
+    return [value for _, value in outcomes]
 
 
 def timed(fn: Callable[[], T]) -> tuple[float, T]:

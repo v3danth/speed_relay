@@ -13,15 +13,17 @@ clearnet hosts, or the name of a saved profile.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
 import sys
-from typing import Callable, Optional, Sequence
+from typing import Callable, ContextManager, Optional, Sequence
 
 import torrelay
 from torrelay import bench
 from torrelay import daemon
+from torrelay import live
 from torrelay import profile as profile_lib
 from torrelay import proxy
 from torrelay import report
@@ -279,6 +281,7 @@ def bench_options(ns: argparse.Namespace, **overrides) -> bench.BenchOptions:
         "size_mib": ns.size,
         "rtt_samples": ns.rtt_samples,
         "parallel_throughput": getattr(ns, "parallel_throughput", False),
+        "parallel_bootstrap": getattr(ns, "parallel_bootstrap", False),
         "bootstrap_timeout": getattr(ns, "bootstrap_timeout", 180),
         "guards": _fingerprints(getattr(ns, "guard", None)),
         "exits": _fingerprints(getattr(ns, "exit", None)),
@@ -351,6 +354,23 @@ def cmd_list(ns: argparse.Namespace) -> int:
     return 0
 
 
+def watch(ns: argparse.Namespace, command: str,
+          target: Target) -> ContextManager[bench.Observer]:
+    """Chooses how to show a run's progress: live view or plain log.
+
+    Args:
+        ns: Parsed arguments.
+        command: Command name, for the view's title.
+        target: The destination being measured.
+
+    Returns:
+        A context yielding the run's observer.
+    """
+    if ns.no_live or not live.wanted():
+        return contextlib.nullcontext(bench.QUIET)
+    return live.Dashboard(f"torrelay {command}  {target.url}")
+
+
 def cmd_bench(ns: argparse.Namespace) -> int:
     """Implements ``torrelay bench``: race fresh circuits, optionally pin.
 
@@ -364,7 +384,8 @@ def cmd_bench(ns: argparse.Namespace) -> int:
     require_direct_possible(target, ns.direct)
     if ns.apply:
         require_profile(profile, "--apply")
-    results = bench.run(target, bench_options(ns))
+    with watch(ns, "bench", target) as observer:
+        results = bench.run(target, bench_options(ns), observer)
     rows = emit(results, target, profile, ns.json)
     if ns.apply:
         pin(profile, *pins_from(rows, target, ns.apply, ns.exits))
@@ -384,8 +405,10 @@ def cmd_check(ns: argparse.Namespace) -> int:
     require_direct_possible(target, ns.direct)
     default_ports = profile.socks_chain if profile else (_SYSTEM_TOR_PORT,)
     ports = tuple(ns.socks or ()) or default_ports
-    results = bench.check(
-        target, bench_options(ns, connect_only=not ns.full), ports)
+    with watch(ns, "check", target) as observer:
+        results = bench.check(
+            target, bench_options(ns, connect_only=not ns.full), ports,
+            observer)
     emit(results, target, None, ns.json)
     return exit_status(results)
 
@@ -677,6 +700,8 @@ def _add_measure_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--direct", action="store_true",
                         help="add a no-Tor baseline (clearnet only)")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-live", action="store_true",
+                        help="print a plain log instead of the live view")
 
 
 def _add_check(sub: argparse._SubParsersAction) -> None:
@@ -702,7 +727,7 @@ def _add_bench(sub: argparse._SubParsersAction) -> None:
         sub: Subparsers to add to.
     """
     p = _command(sub, "bench", cmd_bench,
-                 "race N fresh Tor circuits in parallel and rank them")
+                 "race N fresh Tor circuits and rank them")
     _add_measure_args(p)
     p.add_argument("-n", "--instances", type=int, default=6)
     p.add_argument("--guard", action="append", metavar="FP",
@@ -712,6 +737,8 @@ def _add_bench(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--connect-only", action="store_true",
                    help="only test connectivity and handshake")
     p.add_argument("--parallel-throughput", action="store_true")
+    p.add_argument("--parallel-bootstrap", action="store_true",
+                   help="start all Tor instances at once")
     p.add_argument("--bootstrap-timeout", type=float, default=180)
     p.add_argument("--apply", type=int, metavar="N",
                    help="pin the top N relays into the profile")

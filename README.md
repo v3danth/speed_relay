@@ -44,8 +44,14 @@ Add `--insecure` to skip TLS verification, `--key`/`--user`/`-o` for SSH.
 ./bin/torrelay bench https://example.com --exit FP --connect-only
 ```
 
-Latency runs on all circuits at once; throughput runs one circuit at a time
-(`--parallel-throughput` to overlap). `--json` for machine output.
+Each circuit is tested as soon as its Tor is up. In a terminal, a live
+full-screen view (like `top`) shows every instance's bootstrap progress,
+current stage and measurements, re-ranking finished circuits as results
+arrive; `--no-live` prints a plain log instead.
+
+Tor instances bootstrap one at a time (`--parallel-bootstrap` to overlap).
+Speed tests take turns (`--parallel-throughput` to overlap). `--json` for
+machine output.
 
 ## Keep the fastest path (profiles)
 
